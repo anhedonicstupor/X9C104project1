@@ -1,0 +1,429 @@
+/* This sketch is an attempt to control four X9C104 digital potentiometers with an Arduino, three pushbuttons, a rotary encoder, and utilizing
+// a 0.96" OLED display.  The EEPROM library is included for storing the settings after shutdown, although hasn't been implemented yet.
+// There will also be an attempt here to use an HC-06 Bluetooth adapter to control the pots with a mobile device.
+// -written by ANHEDONICSTUPOR, 2023 */
+
+// Libraries for EEPROM, OLED, and Bluetooth
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <EEPROM.h>
+#include "BluetoothSerial.h"
+
+// Check if BluetoothSerial library is available
+#if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
+#error Bluetooth is not enabled! Please run `make menuconfig` to and enable it
+#endif
+
+// OLED display width and height, in pixels
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1 // Reset pin # (or -1 if sharing Arduino reset pin)
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// Arduino/ESP32 pins for INC and UD (shared) and CS for all four; encoder pins and display update flag
+const int INC = 12; // Volume Increment pin
+const int UD = 14;  // Volume Up/Down pin
+const int CS_VOLUME = 19;  // Volume Chip select pin
+const int CS_GAIN = 2; // Chip select pin for Gain potentiometer
+const int CS_TREBLE = 13; // Chip select pin for Treble potentiometer
+const int CS_BASS = 27; // Chip select pin for Bass potentiometer
+const int encoderPinA = 25; // Rotary encoder A pin
+const int encoderPinB = 26; // Rotary encoder B pin
+const int encoderSwitch = 23; // Rotary push button
+int lastEncoded = 0; // used to store an encoder value before it changes to another value
+bool displayNeedsUpdate = false; // Display update flag
+
+// Push buttons
+const int leftButton = 5;
+const int rightButton = 18;
+const int bottomButton = 4;
+
+// Indicators for whether or not buttons were pressed
+bool RbuttonPressed = false;
+bool LbuttonPressed = false;
+bool BbuttonPressed = false;
+bool encoderPressed = false;
+
+// The four potentiometers, plus one to keep track of the total number of them
+enum Potentiometer {
+  VOLUME, //0
+  GAIN, //1
+  TREBLE, //2
+  BASS, //3
+  NUM_POTS, //4
+};
+
+// To screen print the actual names of the pots
+const char* potNames[NUM_POTS] = {"Volume", "Gain", "High", "Low"};
+
+// The Bluetooth serial reader
+BluetoothSerial SerialBT;
+
+
+// "screenValues" is ONLY the label for the on-screen values
+int screenValues[NUM_POTS] = {50,50,50,50};
+Potentiometer selectedPot = VOLUME;
+
+// Here is the placeholder for the actual X9C chip's values; other code is written herein to get it to match screenValues
+int x9cValues[NUM_POTS] = {0, 0, 0, 0};
+
+// This integer is specifically for the Volume pot, adjusted via Bluetooth by a slider. For testing purposes, prob need to delete
+int setVolPotValue = 0;
+
+// I used this to shore up some text.  Changes could easily be made for a different look and feel
+void centerText(const char* text, int y) {
+    int charWidth = 6; // Width of each character in pixels for the default font
+    int textLength = strlen(text); // Number of characters in the text
+    int textWidth = textLength * charWidth; // Total width of the text in pixels
+    int displayWidth = display.width();
+    int x = (displayWidth - textWidth) / 2; // Calculate starting x position
+    display.setCursor(x, y);
+    display.print(text);
+}
+
+// Function to send pot values to the app, opening up two-way communication between pedal and mobile device
+void sendPotValueToApp(Potentiometer pot, int value) {
+    String message = String(selectedPot) + ":" + String(value) + ":";
+    SerialBT.println(message);
+}
+
+// This one does what the one above does, but cycles through each pot.  It's existence is necessary for the "save presets" function of the app to work
+void sendPotValuesToApp(Potentiometer pots, int values) {
+    selectedPot = VOLUME;
+    String messages = String(selectedPot) + ":" + String(values) + ":";
+    SerialBT.println(messages);
+    selectedPot = GAIN;
+    SerialBT.println(messages);
+    selectedPot = TREBLE;
+    SerialBT.println(messages);
+    selectedPot = BASS;
+    SerialBT.println(messages);
+    selectedPot = VOLUME; 
+}
+
+/* Bluetooth needs to read text going from mobile device to pedal to increase/decrease selectedPot values.
+ Below is an exhaustive list of text-based commands for the pedal. The "if-then" structure was preferred over a "switch-case" layout
+ mainly because we're dealing with strings vs. integers or other numbers/data.  Also, it enables use of text-based commands in the event
+ that control over the pedal is needed outside of the mobile software.  These commands can be input and sent to the pedal via any
+ serial bluetooth terminal app that can connect to the pedal. */
+
+void handleSerialInput() {
+    if (SerialBT.available() > 0) {
+        String input = SerialBT.readStringUntil('\n'); // -Enter- key can be used in bluetooth terminal app in place of \n, which just terminates the string
+        input.trim(); // Remove any whitespace
+        // The first two commands increase or decrease screenValues by 1
+        if (input == "increment") {
+            screenValues[selectedPot] = min(screenValues[selectedPot] + 1, 100);
+            // The adjustPot function must be entered below each text command 
+            // to get the screenValues to actually match X9C values when the command is received, if needed
+            adjustPot(selectedPot, screenValues[selectedPot]); 
+        } else if (input == "decrement") {
+            screenValues[selectedPot] = max(screenValues[selectedPot] - 1, 0);
+            adjustPot(selectedPot, screenValues[selectedPot]);
+        // The next four commands change the selectedPot
+        } else if (input == "selectVolume") {
+            selectedPot = VOLUME;
+            adjustPot(selectedPot, screenValues[selectedPot]);
+        } else if (input == "selectGain") {
+            selectedPot = GAIN;
+            adjustPot(selectedPot, screenValues[selectedPot]);
+        } else if (input == "selectHigh") {
+            selectedPot = TREBLE;
+            adjustPot(selectedPot, screenValues[selectedPot]);
+        } else if (input == "selectLow") {
+            selectedPot = BASS;
+            adjustPot(selectedPot, screenValues[selectedPot]);
+        // The following code is for the sliders on the app to communicate with the pots
+        } else if (input.startsWith("SetVolVal")) {
+            String numberVolString = input.substring(strlen("SetVolVal")); // Extract the number part of the command
+            int value = numberVolString.toInt(); // Convert the number string to an integer
+            screenValues[VOLUME] = constrain(value, 0, 100); // Constrain and set the volume pot value
+            adjustPot(VOLUME, screenValues[VOLUME]);
+            displayNeedsUpdate = true;
+        } else if (input.startsWith("SetGainVal")) {
+            String numberGainString = input.substring(strlen("SetGainVal"));
+            int value = numberGainString.toInt();
+            screenValues[GAIN] = constrain(value, 0, 100);
+            adjustPot(GAIN, screenValues[GAIN]);
+            displayNeedsUpdate = true;
+        } else if (input.startsWith("SetTrebVal")) {
+            String numberTrebString = input.substring(strlen("SetTrebVal"));
+            int value = numberTrebString.toInt();
+            screenValues[TREBLE] = constrain(value, 0, 100);
+            adjustPot(TREBLE, screenValues[TREBLE]);
+            displayNeedsUpdate = true;
+        } else if (input.startsWith("SetBassVal")) {
+            String numberBassString = input.substring(strlen("SetBassVal"));
+            int value = numberBassString.toInt();
+            screenValues[BASS] = constrain(value, 0, 100);
+            adjustPot(BASS, screenValues[BASS]);
+            displayNeedsUpdate = true;
+        } else if (input == "updateApp") { /* This command sends data from the pedal to the app to update the mobile readout when onboard controls are used.
+         The reason that the app requires a prompt to update its info. is that keeping this function on at all times slows down the pedal*/
+            selectedPot = VOLUME;
+            sendPotValueToApp(VOLUME, screenValues[VOLUME]);
+            delay(100);
+            selectedPot = GAIN;
+            sendPotValueToApp(GAIN, screenValues[GAIN]);
+            delay(100);
+            selectedPot = TREBLE;
+            sendPotValueToApp(TREBLE, screenValues[TREBLE]);
+            delay(100);
+            selectedPot = BASS;
+            sendPotValueToApp(BASS, screenValues[BASS]);
+            delay(100);
+        }
+        // add more "else-if" conditions HERE for other commands
+
+          displayNeedsUpdate = true;
+        }
+
+    }
+
+// The adjustPot function in this sketch is key for getting the displayed value to match the X9C value by adjusting the chip accordingly
+void adjustPot(Potentiometer pot, int targetValue){
+  int csPin;
+  // First, set the CS pin to enable the chip
+  switch (pot) {
+    case VOLUME: csPin = CS_VOLUME; break;
+    case GAIN: csPin = CS_GAIN; break;
+    case TREBLE: csPin = CS_TREBLE; break;
+    case BASS: csPin = CS_BASS; break;
+    default: return; 
+  }
+  // Next, zero out the potentiometer to ensure that screen values match X9C when pulsed
+  digitalWrite(UD, LOW); // Set UD pin to LOW for decrementing
+  digitalWrite(csPin, LOW);
+  delayMicroseconds(10); 
+  for (int i = 0; i < 100; i++) { // Assuming 100 steps is the full range
+    digitalWrite(INC, HIGH);
+    delayMicroseconds(10); 
+    digitalWrite(INC, LOW);
+    delayMicroseconds(10); 
+  }
+  // Now adjust X9C to the target value
+  bool increase = targetValue > 0;
+  digitalWrite(UD, increase ? HIGH : LOW); // Set UD pin to HIGH for incrementing
+  digitalWrite(csPin, LOW); 
+  delayMicroseconds(10); 
+  for (int i = 0; i < targetValue; i++) { // This loop adjusts the X9C's value targetValue number of times
+    digitalWrite(INC, HIGH);
+    delayMicroseconds(10); 
+    digitalWrite(INC, LOW);
+    delayMicroseconds(10); 
+  }
+  x9cValues[pot] = targetValue; // Update the stored value
+  digitalWrite(csPin, HIGH); // Turn off the potentiometer to prevent noise from adjusting it
+  /*sendPotValueToApp(VOLUME, screenValues[VOLUME]);
+  sendPotValueToApp(GAIN, screenValues[GAIN]);
+  sendPotValueToApp(TREBLE, screenValues[TREBLE]);
+  sendPotValueToApp(BASS, screenValues[BASS]);*/
+}
+
+// Just put this here to avoid repetition for setting up the display
+void setDisplayUp() { 
+  display.clearDisplay();// Clear the buffer (this clears the Adafruit splash screen)
+  display.setTextSize(1);  // Set text size and color
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0,0);  // Set the cursor to the top-left corner
+}
+
+// Draws the pot meter on screen
+void drawProgressBar(int value) {
+ // Map the value to the width of the display
+ int width = map(value, 0, 100, 0, SCREEN_WIDTH); // Assuming the value is between 0 and 100
+ // Draw the progress bar
+ display.drawRect(0, 32, SCREEN_WIDTH, 16, SSD1306_WHITE); // Draw the outline of the progress bar
+ display.fillRect(0, 32, width, 16, SSD1306_WHITE); // Fill the progress bar according to the pot value
+}
+
+// Function called whenever input is received to show changes on screen
+void updateDisplay() {
+  display.clearDisplay();
+  display.setCursor(0,0);
+  display.setTextSize(2);
+  display.println(potNames[selectedPot]);
+  display.setTextSize(2);
+  display.print("    ");
+  display.println(screenValues[selectedPot]);
+  drawProgressBar(screenValues[selectedPot]);
+  display.setTextSize(1);
+  centerText("Digitech - Bad Monkey", 50);
+  display.display();
+  delay(10);
+}
+
+// This method just cranks the pot to 0 or 100 in one command
+void sweepPot() {
+  for(int i = 0; i < 100; i++) {
+  digitalWrite(INC, HIGH);
+  delayMicroseconds (10); // Reduced from 10
+  digitalWrite(INC, LOW);
+  delayMicroseconds (10); // Reduced from 10
+  }
+}
+
+// Here is the main setup code, executes on the startup of the device
+void setup() {
+  Serial.begin(115200); // Initialize serial communication at 115200 baud rate; for debugging purposes only
+  // Start the OLED display
+   if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { // Address 0x3C for 128x64
+    for(;;); // Don't proceed, loop forever
+  }
+  Wire.setClock(400000);
+  setDisplayUp();
+  display.println(F("LMFX Bad Monkey Clone"));  // Landing Screen
+  drawProgressBar(50); // Generic, 12 o'clock value
+  display.display();  // Send the buffer to the display
+
+  // Set pins as output, buttons with pullup resistors
+  pinMode(rightButton, INPUT_PULLUP);
+  pinMode(leftButton, INPUT_PULLUP);
+  pinMode(bottomButton, INPUT_PULLUP);
+  pinMode(INC, OUTPUT);
+  pinMode(UD, OUTPUT);
+  pinMode(CS_VOLUME, OUTPUT); // Volume Pot CS pin
+  pinMode(CS_GAIN, OUTPUT);   // Gain Pot CS
+  pinMode(CS_TREBLE, OUTPUT);    // Treble Pot CS
+  pinMode(CS_BASS, OUTPUT);   // Bass Pot CS
+
+  // Set the rotary encoder pins
+  pinMode(encoderPinA, INPUT);
+  pinMode(encoderPinB, INPUT);
+  pinMode(encoderSwitch, INPUT_PULLUP);
+
+  // Turn on all pots to start
+  digitalWrite(CS_VOLUME, LOW);
+  delayMicroseconds(10); // Reduced from 10
+  digitalWrite(CS_GAIN, LOW);
+  delayMicroseconds(10);
+  digitalWrite(CS_TREBLE, LOW);
+  delayMicroseconds(10);
+  digitalWrite(CS_BASS, LOW);
+  delayMicroseconds(10);
+
+// Set pots to go down to zero by setting the pots' UD pins to LOW
+  digitalWrite(UD, LOW);
+  delayMicroseconds(10);
+  sweepPot(); // Zero all pots out
+// Now turn them back up to their selected values
+  screenValues[selectedPot] = min(screenValues[selectedPot] + 1, 100); // Decrement and constrain the value; can still go into negatives, which can align on screen value with X9C values if needed
+  adjustPot(selectedPot, screenValues[selectedPot]);
+
+// Turn off all pots again, to avoid noise changing the pots' values
+  digitalWrite(CS_GAIN, HIGH);
+  digitalWrite(CS_TREBLE, HIGH);
+  digitalWrite(CS_BASS, HIGH);
+  digitalWrite(CS_VOLUME, HIGH);
+
+// Bluetooth pairing
+  SerialBT.begin("Bad_Monkey_Clone_ESP32"); // Bluetooth device name
+  Serial.println("The device started, now you can pair it with bluetooth");
+}
+
+// This code repeats continuously while the device is powered up
+void loop() {
+int rightButtonState = digitalRead(rightButton);
+int leftButtonState = digitalRead(leftButton);
+int bottomButtonState = digitalRead(bottomButton);
+int encoderButtonState = digitalRead(encoderSwitch);
+
+// Set the rotary encoder for input
+  int MSB = digitalRead(encoderPinA); //MSB = most significant bit
+  int LSB = digitalRead(encoderPinB); //LSB = least significant bit
+  int encoded = (MSB << 1) | LSB; //converting the 2 pin value to single number
+  int sum  = (lastEncoded << 2) | encoded; //adding it to the previous encoded value
+// I commented out some of the rotary encoder positions because the encoder was moving several positions w/ each click
+  if(sum == 0b1101) { //|| sum == 0b0100 || sum == 0b0010 || sum == 0b1011) { 
+    screenValues[selectedPot] = min(screenValues[selectedPot] + 1, 100); // Increment and constrain the value
+    adjustPot(selectedPot, screenValues[selectedPot]);
+    sendPotValueToApp(selectedPot, screenValues[selectedPot]);
+    displayNeedsUpdate = true;
+    sendPotValueToApp(selectedPot, screenValues[selectedPot]);
+  }
+  if(sum == 0b1110) { // || sum == 0b0111 || sum == 0b0001 || sum == 0b1000) { 
+    screenValues[selectedPot] = min(screenValues[selectedPot] - 1, 100); // Increment and constrain the value
+    adjustPot(selectedPot, screenValues[selectedPot]);
+    displayNeedsUpdate = true;
+    sendPotValueToApp(selectedPot, screenValues[selectedPot]);
+  }
+    lastEncoded = encoded; // Stores this value for next time
+
+// Check if button is pressed w/ right, left, or bottom ButtonState
+// Start with the right button, which changes which pot via selectedPot variable
+  if (rightButtonState == LOW && !RbuttonPressed) {
+    RbuttonPressed = true;
+    selectedPot = (Potentiometer)((selectedPot + 1) % NUM_POTS);
+    display.clearDisplay();
+  switch(selectedPot) {
+    case VOLUME:
+      digitalWrite(CS_BASS, HIGH); // Set CS pin to HIGH on previous pot, to turn it off again. Turning on/off also changes the pot's value by 1X....
+      displayNeedsUpdate = true;
+      break;
+    case GAIN:
+      digitalWrite(CS_VOLUME, HIGH);
+      displayNeedsUpdate = true;
+      break;
+    case TREBLE:
+      digitalWrite(CS_GAIN, HIGH);
+      displayNeedsUpdate = true;
+      break;
+    case BASS:
+      digitalWrite(CS_TREBLE, HIGH);
+      displayNeedsUpdate = true;
+      break;
+  }
+  display.setTextSize(1);
+  display.println(screenValues[selectedPot]); // shows the numerical value of the selected pot
+  drawProgressBar(screenValues[selectedPot]); // moves the rectangular progress bar to the selected pot's value of fullness
+  display.display();
+  delay(200); // May need adjusted for performance
+} else if (rightButtonState == HIGH) {
+  RbuttonPressed = false;
+}
+
+// Encoder push button changes the selected pot
+if (encoderButtonState == LOW && !encoderPressed) {
+  delay(200);
+  encoderPressed = true;
+  selectedPot = (Potentiometer)((selectedPot + 1) % NUM_POTS);
+  display.clearDisplay();
+  displayNeedsUpdate = true;
+  sendPotValueToApp(selectedPot, screenValues[selectedPot]);
+  } else if (encoderButtonState == HIGH) {
+  encoderPressed = false;
+}
+
+// Start of left button; increments the value of the selected potentiometer
+  if (leftButtonState == LOW && !LbuttonPressed) {
+    LbuttonPressed = true;
+    screenValues[selectedPot] = min(screenValues[selectedPot] + 1, 100); // Increment and constrain the value
+    adjustPot(selectedPot, screenValues[selectedPot]);
+    displayNeedsUpdate = true;
+    sendPotValueToApp(selectedPot, screenValues[selectedPot]);
+ } else if (leftButtonState == HIGH) {
+    LbuttonPressed = false; 
+    display.println(screenValues[selectedPot]);
+  }
+
+// Start of bottom button; decrements selectedPot value
+  if (bottomButtonState == LOW && !BbuttonPressed) {
+    BbuttonPressed = true;
+    screenValues[selectedPot] = min(screenValues[selectedPot] - 1, 100); // Increment and constrain the value
+    adjustPot(selectedPot, screenValues[selectedPot]);
+    sendPotValueToApp(selectedPot, screenValues[selectedPot]);
+    displayNeedsUpdate = true;
+  } else if (bottomButtonState == HIGH) {
+  BbuttonPressed = false; 
+  display.println(screenValues[selectedPot]);
+}
+
+// Flag for the display updates
+if (displayNeedsUpdate) {
+    updateDisplay(); // Calling function to update the display
+    displayNeedsUpdate = false;
+  }
+  
+handleSerialInput(); // Check for Bluetooth serial (text) input
+}
